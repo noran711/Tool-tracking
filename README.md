@@ -6,7 +6,7 @@ folder structure needed for the code to run:
 
 
   enter in line 9 your folder with your dataset (structure as discribed above)
-  enter in line 10 the name for your folder with the augmented data 
+  enter in line 10 the name for your folder with the augmented data (this folder will automatically created with it´s subfolders)
 
   code takes all the images + the mask from the input folder, augments them and saves them in a new folder with subfolders images und masks
 
