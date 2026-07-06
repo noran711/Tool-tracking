@@ -1,50 +1,68 @@
 import cv2
 import cv2.aruco as aruco
 import numpy as np
-import time
 from pathlib import Path
 
+
+# Zielmarker und erlaubte verlorene Frames
 TARGET_ID = 0
 MAX_LOST_FRAMES = 10
-SPEED = 1.0
 
-# Reale Markergröße: 15 mm
-MARKER_LENGTH = 0.015  # Meter
-
-# Abstand Markerzentrum -> Stiftspitze.
-# Startwert aus altem Faktor: 15 mm * 5.5 = 82.5 mm
-TIP_OFFSET = 0.14  # Meter
-
-# Spitze relativ zum Marker-Koordinatensystem.
-# Falls falsch: Vorzeichen ändern oder X/Y tauschen.
+# Markergröße und Abstand der Spitze vom Marker
+MARKER_LENGTH = 0.015
+TIP_OFFSET = 0.14
 TIP_3D = np.array([[0, -TIP_OFFSET, 0]], dtype=np.float32)
 
-# Alternativen testen, falls die Spitze auf der falschen Achse liegt:
-# TIP_3D = np.array([[0, TIP_OFFSET, 0]], dtype=np.float32)
-# TIP_3D = np.array([[TIP_OFFSET, 0, 0]], dtype=np.float32)
-# TIP_3D = np.array([[-TIP_OFFSET, 0, 0]], dtype=np.float32)
-
-# Stabilisierung: kleiner = schneller, größer = ruhiger
+# Glättung der Pose
 POSE_SMOOTHING = 0.35
 MAX_ROT_JUMP_DEG = 60
-MAX_TIP_JUMP_PX = 160
 
-video_path = Path(__file__).parent / "test2.mp4"
-cap = cv2.VideoCapture(str(video_path))
+# Anzeigeeinstellungen
+SHOW_TRAIL = True
+TRAIL_LENGTH = 50
+TIP_RADIUS = 6
+TRAIL_THICKNESS = 2
+
+SHOW_MARKER = True
+SHOW_CENTER = True
+SHOW_DIRECTION = True
+
+# Ein- und Ausgabevideo
+BASE_DIR = Path(__file__).parent
+VIDEO_PATH = BASE_DIR / "test2.mp4"
+OUTPUT_PATH = BASE_DIR / "test2_tracked_tip_visualized.mp4"
+MAX_DURATION_SECONDS = 10
+
+
+# Video öffnen
+cap = cv2.VideoCapture(str(VIDEO_PATH))
 
 if not cap.isOpened():
-    print(f"Video konnte nicht geöffnet werden: {video_path}")
-    exit()
+    raise FileNotFoundError(f"Video konnte nicht geoeffnet werden: {VIDEO_PATH}")
 
+# Videoinformationen auslesen
 video_fps = cap.get(cv2.CAP_PROP_FPS)
 if video_fps <= 0:
-    video_fps = 30
+    video_fps = 30.0
 
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# Näherungsweise Kameramatrix.
-# Für präzises Tracking bitte durch echte Kamerakalibrierung ersetzen.
+# Ausgabevideo vorbereiten
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+writer = cv2.VideoWriter(
+    str(OUTPUT_PATH),
+    fourcc,
+    video_fps,
+    (frame_width, frame_height)
+)
+
+if not writer.isOpened():
+    cap.release()
+    raise RuntimeError(f"Ausgabevideo konnte nicht erstellt werden: {OUTPUT_PATH}")
+
+
+# Vereinfachte Kameramatrix
 focal_length = frame_width
 camera_matrix = np.array([
     [focal_length, 0, frame_width / 2],
@@ -52,10 +70,11 @@ camera_matrix = np.array([
     [0, 0, 1]
 ], dtype=np.float32)
 
+# Keine Linsenverzerrung angenommen
 dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 
-delay = int((1000 / video_fps) / SPEED)
 
+# ArUco-Detektor einstellen
 dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 
 params = aruco.DetectorParameters()
@@ -74,6 +93,7 @@ params.minDistanceToBorder = 3
 
 detector = aruco.ArucoDetector(dictionary, params)
 
+# 3D-Eckpunkte des Markers
 half = MARKER_LENGTH / 2
 object_points = np.array([
     [-half,  half, 0],
@@ -82,7 +102,8 @@ object_points = np.array([
     [-half, -half, 0],
 ], dtype=np.float32)
 
-# Kalman Filter für Stiftspitze: [x_tip, y_tip, vx, vy]
+
+# Kalman-Filter für die Spitze
 kalman = cv2.KalmanFilter(4, 2)
 
 kalman.measurementMatrix = np.array([
@@ -90,23 +111,33 @@ kalman.measurementMatrix = np.array([
     [0, 1, 0, 0]
 ], dtype=np.float32)
 
-# Reaktionsfreudiger Kalman-Filter
 kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
 kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.5
 kalman.errorCovPost = np.eye(4, dtype=np.float32)
 
-initialized = False
-trail = []
-lost_frames = 0
-prev_time = time.time()
+dt = 1.0 / video_fps
+kalman.transitionMatrix = np.array([
+    [1, 0, dt, 0],
+    [0, 1, 0, dt],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+], dtype=np.float32)
 
+
+# Zustandsvariablen
+initialized = False
 pose_initialized = False
+
 last_rvec = None
 last_tvec = None
 last_raw_tip = None
 
+lost_frames = 0
+trail = []
+
 
 def rotation_jump_degrees(rvec_a, rvec_b):
+    # Rotationssprung zwischen zwei Posen berechnen
     r_a, _ = cv2.Rodrigues(rvec_a)
     r_b, _ = cv2.Rodrigues(rvec_b)
 
@@ -118,6 +149,7 @@ def rotation_jump_degrees(rvec_a, rvec_b):
 
 
 def project_point(point_3d, rvec, tvec):
+    # 3D-Punkt ins Bild projizieren
     projected, _ = cv2.projectPoints(
         point_3d,
         rvec,
@@ -128,12 +160,13 @@ def project_point(point_3d, rvec, tvec):
     return projected[0, 0]
 
 
-def choose_stable_pose(c):
-    global pose_initialized, last_rvec, last_tvec, last_raw_tip
+def choose_stable_pose(corners_2d):
+    # Stabilste Pose aus den möglichen Lösungen wählen
+    global pose_initialized, last_rvec, last_raw_tip
 
     result = cv2.solvePnPGeneric(
         object_points,
-        c,
+        corners_2d,
         camera_matrix,
         dist_coeffs,
         flags=cv2.SOLVEPNP_IPPE_SQUARE
@@ -164,9 +197,14 @@ def choose_stable_pose(c):
             score += rotation_jump_degrees(candidate_rvec, last_rvec) * 1.5
 
         if last_raw_tip is not None:
-            candidate_tip = project_point(TIP_3D, candidate_rvec, candidate_tvec)
-            tip_jump = np.linalg.norm(candidate_tip - np.array(last_raw_tip))
-            score += tip_jump * 0.8
+            candidate_tip = project_point(
+                TIP_3D,
+                candidate_rvec,
+                candidate_tvec
+            )
+            score += np.linalg.norm(
+                candidate_tip - np.array(last_raw_tip)
+            ) * 0.8
 
         if best_score is None or score < best_score:
             best_score = score
@@ -179,40 +217,31 @@ def choose_stable_pose(c):
     return True, best_rvec, best_tvec
 
 
+# Maximale Frameanzahl festlegen
+max_frames = int(video_fps * MAX_DURATION_SECONDS)
+frame_count = 0
+
 while True:
     ret, frame = cap.read()
 
-    if not ret:
-        print("Video fertig.")
+    if not ret or frame_count >= max_frames:
         break
 
-    now = time.time()
-    tracker_dt = now - prev_time
-    prev_time = now
+    frame_count += 1
 
-    # Für Video-Dateien ist ein fixes dt stabiler als echte Rechenzeit.
-    dt = 1.0 / video_fps
-    tracker_fps = 1.0 / max(tracker_dt, 1e-6)
+    # Nächste Position vorhersagen
+    kalman.predict()
 
-    kalman.transitionMatrix = np.array([
-        [1, 0, dt, 0],
-        [0, 1, 0, dt],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1]
-    ], dtype=np.float32)
-
-    prediction = kalman.predict()
-    pred_x = int(prediction[0, 0])
-    pred_y = int(prediction[1, 0])
-
+    # Marker im aktuellen Frame suchen
     corners, ids, _ = detector.detectMarkers(frame)
 
     found = False
-    angle = None
+    display_tip = None
+    display_center = None
+    display_marker_corners = None
+    display_marker_id = None
 
     if ids is not None:
-        aruco.drawDetectedMarkers(frame, corners, ids)
-
         for i in range(len(ids)):
             marker_id = int(ids[i][0])
 
@@ -226,13 +255,19 @@ while True:
             if not success:
                 continue
 
+            # Pose glätten
             if pose_initialized:
                 rot_jump = rotation_jump_degrees(rvec, last_rvec)
 
                 if rot_jump <= MAX_ROT_JUMP_DEG:
-                    rvec = POSE_SMOOTHING * last_rvec + (1.0 - POSE_SMOOTHING) * rvec
-                    tvec = POSE_SMOOTHING * last_tvec + (1.0 - POSE_SMOOTHING) * tvec
-
+                    rvec = (
+                        POSE_SMOOTHING * last_rvec
+                        + (1.0 - POSE_SMOOTHING) * rvec
+                    )
+                    tvec = (
+                        POSE_SMOOTHING * last_tvec
+                        + (1.0 - POSE_SMOOTHING) * tvec
+                    )
 
             last_rvec = rvec.copy()
             last_tvec = tvec.copy()
@@ -240,6 +275,7 @@ while True:
 
             center_3d = np.array([[0, 0, 0]], dtype=np.float32)
 
+            # Markerzentrum und Spitze projizieren
             projected_center, _ = cv2.projectPoints(
                 center_3d,
                 rvec,
@@ -259,25 +295,14 @@ while True:
             center_x, center_y = projected_center[0, 0].astype(int)
             tip_x, tip_y = projected_tip[0, 0].astype(int)
 
-            if last_raw_tip is not None:
-                jump = np.linalg.norm(
-                    np.array([tip_x, tip_y]) - np.array(last_raw_tip)
-                )
-
-                last_raw_tip = (tip_x, tip_y)
-
-            else:
-                last_raw_tip = (tip_x, tip_y)
-
-            dx = tip_x - center_x
-            dy = tip_y - center_y
-            angle = np.degrees(np.arctan2(dy, dx))
+            last_raw_tip = (tip_x, tip_y)
 
             measurement = np.array([
                 [np.float32(tip_x)],
                 [np.float32(tip_y)]
             ])
 
+            # Kalman-Filter initialisieren
             if not initialized:
                 kalman.statePost = np.array([
                     [np.float32(tip_x)],
@@ -287,129 +312,104 @@ while True:
                 ], dtype=np.float32)
                 initialized = True
 
+            # Messung korrigieren
             corrected = kalman.correct(measurement)
 
             smooth_tip_x = int(corrected[0, 0])
             smooth_tip_y = int(corrected[1, 0])
 
+            display_tip = (smooth_tip_x, smooth_tip_y)
+            display_center = (center_x, center_y)
+            display_marker_corners = [corners[i]]
+            display_marker_id = ids[i:i + 1]
+
             found = True
             lost_frames = 0
-
-            #cv2.drawFrameAxes(
-            #    frame,
-            #    camera_matrix,
-            #    dist_coeffs,
-            #    rvec,
-            #    tvec,
-            #    MARKER_LENGTH * 0.5
-            #)
-
-            cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
-            cv2.putText(frame, "marker center",
-                        (center_x + 10, center_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 0, 255),
-                        1)
-
-            cv2.circle(frame, (tip_x, tip_y), 6, (0, 165, 255), -1)
-            cv2.putText(frame, "raw tip",
-                        (tip_x + 10, tip_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 165, 255),
-                        1)
-
-            cv2.circle(frame, (smooth_tip_x, smooth_tip_y), 9, (0, 255, 0), -1)
-            cv2.putText(frame,
-                        f"tip | ID {marker_id}",
-                        (smooth_tip_x + 10, smooth_tip_y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 255, 0),
-                        2)
-
-            #cv2.line(frame,
-            #         (center_x, center_y),
-            #         (smooth_tip_x, smooth_tip_y),
-            #         (0, 255, 0),
-            #         2)
-
-            trail.append((smooth_tip_x, smooth_tip_y))
             break
 
+    # Keine gültige Markererkennung
     if not found and initialized:
         lost_frames += 1
+        display_tip = None
 
-        if lost_frames <= MAX_LOST_FRAMES:
-            cv2.circle(frame, (pred_x, pred_y), 9, (255, 0, 0), -1)
-            cv2.putText(frame,
-                        "predicted tip",
-                        (pred_x + 10, pred_y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (255, 0, 0),
-                        2)
+    if display_tip is not None:
+        tip_x, tip_y = display_tip
 
-    for i in range(1, len(trail)):
-        cv2.line(frame, trail[i - 1], trail[i], (255, 255, 0), 2)
+        if 0 <= tip_x < frame_width and 0 <= tip_y < frame_height:
+            # Marker einzeichnen
+            if display_marker_corners is not None and SHOW_MARKER:
+                aruco.drawDetectedMarkers(
+                    frame,
+                    display_marker_corners,
+                    display_marker_id
+                )
 
-    if len(trail) > 80:
-        trail.pop(0)
+            # Mittelpunkt einzeichnen
+            if display_center is not None and SHOW_CENTER:
+                cv2.circle(
+                    frame,
+                    display_center,
+                    5,
+                    (0, 0, 255),
+                    -1,
+                    cv2.LINE_AA
+                )
 
-    cv2.putText(frame,
-                f"Playback FPS: {video_fps:.1f}",
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+            # Richtung zur Spitze einzeichnen
+            if display_center is not None and SHOW_DIRECTION:
+                cv2.arrowedLine(
+                    frame,
+                    display_center,
+                    display_tip,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                    tipLength=0.08
+                )
+
+            # Bewegungsspur speichern
+            trail.append(display_tip)
+
+            if len(trail) > TRAIL_LENGTH:
+                trail.pop(0)
+
+            # Bewegungsspur einzeichnen
+            if SHOW_TRAIL and len(trail) > 1:
+                for j in range(1, len(trail)):
+                    alpha = j / len(trail)
+                    thickness = max(1, int(TRAIL_THICKNESS * alpha))
+                    cv2.line(
+                        frame,
+                        trail[j - 1],
+                        trail[j],
+                        (255, 255, 255),
+                        thickness,
+                        cv2.LINE_AA
+                    )
+
+            # Spitze einzeichnen
+            cv2.circle(
+                frame,
+                display_tip,
+                TIP_RADIUS + 3,
                 (255, 255, 255),
-                2)
+                -1,
+                cv2.LINE_AA
+            )
+            cv2.circle(
+                frame,
+                display_tip,
+                TIP_RADIUS,
+                (0, 165, 255),
+                -1,
+                cv2.LINE_AA
+            )
 
-    cv2.putText(frame,
-                f"Tracker FPS: {tracker_fps:.1f}",
-                (20, 65),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2)
+    writer.write(frame)
 
-    if angle is not None:
-        cv2.putText(frame,
-                    f"Angle: {angle:.1f} deg",
-                    (20, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2)
 
-    cv2.putText(frame,
-                f"Marker: {MARKER_LENGTH * 1000:.1f} mm",
-                (20, 125),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2)
-
-    cv2.putText(frame,
-                f"Tip offset: {TIP_OFFSET * 1000:.1f} mm",
-                (20, 155),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2)
-
-    cv2.putText(frame,
-                "ESC = quit",
-                (20, frame.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (180, 180, 180),
-                2)
-
-    cv2.imshow("Aruco Pen Tip Tracking", frame)
-
-    if cv2.waitKey(delay) == 27:
-        break
-
+# Ressourcen freigeben
 cap.release()
-cv2.destroyAllWindows()
+writer.release()
+
+print(f"Fertig. Das getrackte Video wurde gespeichert unter:\n{OUTPUT_PATH}")
