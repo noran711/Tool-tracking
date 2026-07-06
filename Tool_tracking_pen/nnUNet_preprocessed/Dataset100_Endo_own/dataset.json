@@ -1,0 +1,14 @@
+{
+    "channel_names": {
+        "0": "R",
+        "1": "G",
+        "2": "B"
+    },
+    "labels": {
+        "background": 0,
+        "shaft": 2,
+        "manipulator": 1
+    },
+    "numTraining": 140,
+    "file_ending": ".png"
+}
