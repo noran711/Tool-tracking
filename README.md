@@ -41,5 +41,4 @@ Contains the final tracking results and evaluation scripts for all three trained
 
 - nnU-Net-based segmentation
 - Segmentation evaluation (**Dice, IoU, Precision, Recall**)
-- Generated result videos
 - Evaluation outputs
